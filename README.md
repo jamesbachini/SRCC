@@ -1,7 +1,7 @@
 
-# Simple Rust Blockchain Network
+# SRCC - Simple Rust Consensus Client
 
-This project implements a simple blockchain network using Rust and the Tokio asynchronous runtime. The blockchain nodes communicate over TCP, using a single port for both sending and receiving messages. This example demonstrates peer-to-peer communication, blockchain creation, and broadcasting of new blocks.
+This project implements a simple blockchain network using Rust and the Tokio asynchronous runtime. The blockchain nodes communicate over TCP to create a p2p network and broadcast new blocks to a shared blockchain which is used to chronologically store gossip data.
 
 ## Features
 
@@ -87,6 +87,16 @@ Broadcasting new block: Block { index: 0, previous_hash: "0", timestamp: 1234567
 ## Contributing
 
 If you have suggestions for improving this project, please open an issue or submit a pull request. Contributions are welcome!
+
+## Links
+
+https://jamesbachini.com
+https://www.youtube.com/c/JamesBachini
+https://bachini.substack.com
+https://podcasters.spotify.com/pod/show/jamesbachini
+https://twitter.com/james_bachini
+https://www.linkedin.com/in/james-bachini/
+https://github.com/jamesbachini
 
 ## License
 
