@@ -21,6 +21,7 @@ enum Message {
     NewPeer(Peer),
     NewBlock(Block),
     RequestBlock,
+    KeepAlive,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -30,7 +31,7 @@ struct Block {
     timestamp: u64,
     data: String,
     hash: String,
-    writer: Peer,  // The writer of the next block
+    writer: Peer,
 }
 
 impl Block {
@@ -65,14 +66,14 @@ impl Blockchain {
     }
 }
 
-type Peers = Arc<RwLock<HashMap<SocketAddr, Arc<RwLock<TcpStream>>>>>;
+type Peers = Arc<RwLock<HashMap<SocketAddr, Peer>>>;
 
 #[tokio::main]
 async fn main() {
     let blockchain = Arc::new(RwLock::new(Blockchain::new()));
     let peers: Peers = Arc::new(RwLock::new(HashMap::new()));
 
-    let ports = [8080, 8081, 8082];
+    let ports = [8080, 8081];
     let mut listener = None;
 
     for port in &ports {
@@ -91,37 +92,41 @@ async fn main() {
     let listener = listener.expect("Failed to bind to any port");
     let local_addr = listener.local_addr().unwrap();
 
+    let peer_id = rand::thread_rng().gen::<u64>();
+    let local_peer = Peer { id: peer_id, address: local_addr };
+
+    // Start logging peers list
+    let peers_clone = peers.clone();
+    tokio::spawn(async move {
+        log_peers(peers_clone).await;
+    });
+
     // Connect to the other known peers
     let peer_addresses = vec![
         "127.0.0.1:8080".parse().unwrap(),
         "127.0.0.1:8081".parse().unwrap(),
-        "127.0.0.1:8082".parse().unwrap(),
+        //"127.0.0.1:8082".parse().unwrap(),
     ];
 
-    for addr in &peer_addresses {
-        if local_addr != *addr {
-            if let Ok(stream) = TcpStream::connect(addr).await {
-                let peers_clone = peers.clone();
-                let local_addr_clone = local_addr.clone();
-                tokio::spawn(async move {
-                    handle_outgoing_connection(stream, local_addr_clone, peers_clone).await;
-                });
-            }
+    for addr in peer_addresses {
+        if local_addr != addr {
+            let peers_clone = peers.clone();
+            let local_peer_clone = local_peer.clone();
+            tokio::spawn(async move {
+                connect_to_peer(addr, local_peer_clone, peers_clone).await;
+            });
         }
     }
 
     // Create genesis block if this is peer 1
     if local_addr.port() == 8080 {
-        let genesis_writer = Peer {
-            id: 1,
-            address: local_addr,
-        };
         let blockchain_clone = blockchain.clone();
         let peers_clone = peers.clone();
+        let local_peer_clone = local_peer.clone();
         tokio::spawn(async move {
             println!("Creating genesis block in 10 secs");
             sleep(Duration::from_secs(10)).await;
-            create_and_broadcast_new_block(blockchain_clone, peers_clone, genesis_writer, true).await;
+            create_and_broadcast_new_block(blockchain_clone, peers_clone, local_peer_clone, true).await;
         });
     }
 
@@ -129,16 +134,30 @@ async fn main() {
         let (socket, addr) = listener.accept().await.unwrap();
         println!("Accepted connection from {}", addr);
         let peers_clone = peers.clone();
+        let local_peer_clone = local_peer.clone();
         tokio::spawn(async move {
-            handle_connection(socket, addr, peers_clone).await;
+            handle_connection(socket, addr, peers_clone, local_peer_clone).await;
         });
     }
 }
 
-async fn handle_outgoing_connection(mut stream: TcpStream, local_addr: SocketAddr, peers: Peers) {
-    let peer_id = rand::thread_rng().gen::<u64>();
-    let new_peer = Peer { id: peer_id, address: local_addr };
-    let message = serde_json::to_string(&Message::NewPeer(new_peer)).unwrap();
+async fn connect_to_peer(addr: SocketAddr, local_peer: Peer, peers: Peers) {
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                println!("Connected to peer: {}", addr);
+                handle_outgoing_connection(stream, local_peer.clone(), peers.clone()).await;
+            }
+            Err(e) => {
+                println!("Failed to connect to peer {}: {}. Retrying in 5 seconds...", addr, e);
+                sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn handle_outgoing_connection(mut stream: TcpStream, local_peer: Peer, peers: Peers) {
+    let message = serde_json::to_string(&Message::NewPeer(local_peer.clone())).unwrap();
 
     if stream.write_all(message.as_bytes()).await.is_ok() {
         println!("Sent NewPeer message to {}", stream.peer_addr().unwrap());
@@ -149,80 +168,30 @@ async fn handle_outgoing_connection(mut stream: TcpStream, local_addr: SocketAdd
 
     let addr = stream.peer_addr().unwrap();
 
-    {
-        let mut peers_write = peers.write().await;
-        peers_write.insert(addr, Arc::new(RwLock::new(stream)));
-    }
-
-    let mut buffer = [0; 1024];
-
-    loop {
-        let stream_arc = {
-            let peers_read = peers.read().await;
-            peers_read.get(&addr).unwrap().clone()
-        };
-        let mut stream_lock = stream_arc.write().await;
-
-        match stream_lock.read(&mut buffer).await {
-            Ok(0) => {
-                println!("Connection closed by {}", addr);
-                break;
-            }
-            Ok(n) => {
-                let received_message: Message = match serde_json::from_slice(&buffer[..n]) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        println!("Failed to deserialize message: {}", e);
-                        continue;
-                    }
-                };
-                println!("Received message: {:?}", received_message);
-                handle_message(received_message, &peers).await;
-            }
-            Err(e) => {
-                println!("Failed to read from socket: {}", e);
-                break;
-            }
-        }
-    }
-
-    {
-        let mut peers_write = peers.write().await;
-        peers_write.remove(&addr);
-    }
+    handle_peer_communication(stream, addr, peers).await;
 }
 
-async fn handle_connection(mut socket: TcpStream, addr: SocketAddr, peers: Peers) {
-    let peer_id = rand::thread_rng().gen::<u64>();
-    let new_peer = Peer { id: peer_id, address: addr };
-
-    let message = serde_json::to_string(&Message::NewPeer(new_peer)).unwrap();
+async fn handle_connection(mut socket: TcpStream, addr: SocketAddr, peers: Peers, local_peer: Peer) {
+    let message = serde_json::to_string(&Message::NewPeer(local_peer.clone())).unwrap();
     if let Err(e) = socket.write_all(message.as_bytes()).await {
         println!("Failed to send NewPeer message to {}: {}", addr, e);
         return;
     }
     println!("Sent NewPeer message to {}", addr);
 
-    {
-        let mut peers_write = peers.write().await;
-        peers_write.insert(addr, Arc::new(RwLock::new(socket)));
-    }
+    handle_peer_communication(socket, addr, peers).await;
+}
 
-    let mut buffer = [0; 1024];
+async fn handle_peer_communication(mut stream: TcpStream, addr: SocketAddr, peers: Peers) {
+    let mut buffer = vec![0; 4096];
 
     loop {
-        let socket_arc = {
-            let peers_read = peers.read().await;
-            peers_read.get(&addr).unwrap().clone()
-        };
-        let mut socket_lock = socket_arc.write().await;
-
-        match socket_lock.read(&mut buffer).await {
-            Ok(0) => {
+        match tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => {
                 println!("Connection closed by {}", addr);
                 break;
             }
-            Ok(n) => {
+            Ok(Ok(n)) => {
                 let received_message: Message = match serde_json::from_slice(&buffer[..n]) {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -233,9 +202,16 @@ async fn handle_connection(mut socket: TcpStream, addr: SocketAddr, peers: Peers
                 println!("Received message from {}: {:?}", addr, received_message);
                 handle_message(received_message, &peers).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 println!("Failed to read from socket: {}", e);
                 break;
+            }
+            Err(_) => {
+                // Timeout occurred, send keep-alive message
+                if let Err(e) = stream.write_all(serde_json::to_string(&Message::KeepAlive).unwrap().as_bytes()).await {
+                    println!("Failed to send keep-alive message: {}", e);
+                    break;
+                }
             }
         }
     }
@@ -250,20 +226,27 @@ async fn handle_message(message: Message, peers: &Peers) {
     match message {
         Message::NewPeer(new_peer) => {
             println!("New peer connected: {:?}", new_peer);
+            let mut peers_write = peers.write().await;
+            peers_write.insert(new_peer.address, new_peer.clone());
+            println!("Added new peer to peers list: {:?}", new_peer);
         }
         Message::NewBlock(block) => {
             println!("New block received: {:?}", block);
             let peers_read = peers.read().await;
             let message = serde_json::to_string(&Message::NewBlock(block)).unwrap();
-            for (_, peer_stream) in peers_read.iter() {
-                let mut peer_stream_lock = peer_stream.write().await;
-                if let Err(e) = peer_stream_lock.write_all(message.as_bytes()).await {
-                    println!("Failed to send NewBlock message: {}", e);
+            for (_, peer) in peers_read.iter() {
+                if let Ok(mut stream) = TcpStream::connect(peer.address).await {
+                    if let Err(e) = stream.write_all(message.as_bytes()).await {
+                        println!("Failed to send NewBlock message: {}", e);
+                    }
                 }
             }
         }
         Message::RequestBlock => {
             println!("Request for block received");
+        }
+        Message::KeepAlive => {
+            // Do nothing, this is just to keep the connection alive
         }
     }
 }
@@ -304,12 +287,21 @@ async fn create_and_broadcast_new_block(blockchain: Arc<RwLock<Blockchain>>, pee
     let message = serde_json::to_string(&Message::NewBlock(new_block.clone())).unwrap();
 
     println!("Broadcasting new block: {:?}", new_block);
-
     let peers_read = peers.read().await;
-    for (_, peer_stream) in peers_read.iter() {
-        let mut peer_stream_lock = peer_stream.write().await;
-        if let Err(e) = peer_stream_lock.write_all(message.as_bytes()).await {
-            println!("Failed to send NewBlock message: {}", e);
+    println!("Broadcasting to peers: {:?}", peers_read);
+    for (_, peer) in peers_read.iter() {
+        if let Ok(mut stream) = TcpStream::connect(peer.address).await {
+            if let Err(e) = stream.write_all(message.as_bytes()).await {
+                println!("Failed to send NewBlock message: {}", e);
+            }
         }
+    }
+}
+
+async fn log_peers(peers: Peers) {
+    loop {
+        sleep(Duration::from_secs(3)).await;
+        let peers_read = peers.read().await;
+        println!("Peers list: {:?}", *peers_read);
     }
 }
