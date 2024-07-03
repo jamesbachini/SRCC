@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration};
@@ -45,6 +44,7 @@ impl Block {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Blockchain {
     blocks: Vec<Block>,
 }
@@ -71,13 +71,10 @@ impl Blockchain {
     }
 }
 
-type SharedBlockchain = Arc<Mutex<Blockchain>>;
-type SharedPeers = Arc<Mutex<Vec<Peer>>>;
-
 #[tokio::main]
 async fn main() {
-    let blockchain = Arc::new(Mutex::new(Blockchain::new()));
-    let peers: SharedPeers = Arc::new(Mutex::new(Vec::new()));
+    let mut blockchain = Blockchain::new();
+    let mut peers: Vec<Peer> = Vec::new();
 
     let ports = [8080, 8081, 8082];
     let mut listener = None;
@@ -105,12 +102,9 @@ async fn main() {
             id: 1,
             address: local_addr,
         };
-        {
-            let mut blockchain = blockchain.lock().unwrap();
-            blockchain.create_genesis_block(genesis_writer.clone());
-            println!("Genesis block created by peer 1");
-        }
-        create_and_broadcast_new_block(blockchain.clone(), peers.clone(), genesis_writer).await;
+        blockchain.create_genesis_block(genesis_writer.clone());
+        println!("Genesis block created by peer 1");
+        create_and_broadcast_new_block(&mut blockchain, &mut peers, genesis_writer).await;
     }
 
     // Connect to the other known peers
@@ -124,7 +118,7 @@ async fn main() {
         if local_addr != *addr {
             match TcpStream::connect(addr).await {
                 Ok(stream) => {
-                    handle_outgoing_connection(stream, local_addr, peers.clone()).await;
+                    handle_outgoing_connection(stream, local_addr, &mut peers).await;
                 }
                 Err(e) => {
                     println!("Failed to connect to peer {}: {}", addr, e);
@@ -136,16 +130,16 @@ async fn main() {
     loop {
         let (socket, addr) = listener.accept().await.unwrap();
         println!("Accepted connection from {}", addr);
-        let blockchain = Arc::clone(&blockchain);
-        let peers = Arc::clone(&peers);
+        let mut blockchain_clone = blockchain.clone();
+        let mut peers_clone = peers.clone();
 
         tokio::spawn(async move {
-            handle_connection(socket, addr, blockchain, peers).await;
+            handle_connection(socket, addr, &mut blockchain_clone, &mut peers_clone).await;
         });
     }
 }
 
-async fn handle_outgoing_connection(mut stream: TcpStream, local_addr: SocketAddr, peers: SharedPeers) {
+async fn handle_outgoing_connection(mut stream: TcpStream, local_addr: SocketAddr, peers: &mut Vec<Peer>) {
     let peer_id = rand::thread_rng().gen::<u64>();
     let new_peer = Peer { id: peer_id, address: local_addr };
     let message = serde_json::to_string(&Message::NewPeer(new_peer)).unwrap();
@@ -174,7 +168,6 @@ async fn handle_outgoing_connection(mut stream: TcpStream, local_addr: SocketAdd
                 println!("Received message: {:?}", received_message);
                 match received_message {
                     Message::NewPeer(new_peer) => {
-                        let mut peers = peers.lock().unwrap();
                         if !peers.iter().any(|p| p.address == new_peer.address) {
                             peers.push(new_peer.clone());
                             println!("Added new peer: {:?}", new_peer);
@@ -191,12 +184,11 @@ async fn handle_outgoing_connection(mut stream: TcpStream, local_addr: SocketAdd
     }
 }
 
-async fn handle_connection(mut socket: TcpStream, addr: SocketAddr, blockchain: SharedBlockchain, peers: SharedPeers) {
+async fn handle_connection(mut socket: TcpStream, addr: SocketAddr, blockchain: &mut Blockchain, peers: &mut Vec<Peer>) {
     let peer_id = rand::thread_rng().gen::<u64>();
     let new_peer = Peer { id: peer_id, address: addr };
 
-    {
-        let mut peers = peers.lock().unwrap();
+    if !peers.iter().any(|p| p.address == new_peer.address) {
         peers.push(new_peer.clone());
         println!("Added new peer: {:?}", new_peer);
     }
@@ -226,28 +218,24 @@ async fn handle_connection(mut socket: TcpStream, addr: SocketAddr, blockchain: 
                 println!("Received message from {}: {:?}", addr, received_message);
                 match received_message {
                     Message::NewPeer(new_peer) => {
-                        let mut peers = peers.lock().unwrap();
                         if !peers.iter().any(|p| p.address == new_peer.address) {
                             peers.push(new_peer.clone());
                             println!("Added new peer: {:?}", new_peer);
                         }
                     }
                     Message::NewBlock(block) => {
-                        {
-                            let mut blockchain = blockchain.lock().unwrap();
-                            blockchain.add_block(block.clone());
-                            println!("New block added: {:?}", blockchain.blocks.last().unwrap());
-                        }
+                        blockchain.add_block(block.clone());
+                        println!("New block added: {:?}", blockchain.blocks.last().unwrap());
                         
                         // Check if this peer is the writer for the next block
                         if block.writer.address == addr {
                             println!("This peer is the writer. Creating a new block in 10 seconds...");
-                            let blockchain_clone = Arc::clone(&blockchain);
-                            let peers_clone = Arc::clone(&peers);
+                            let mut blockchain_clone = blockchain.clone();
+                            let mut peers_clone = peers.clone();
                             let next_writer = block.writer.clone();
                             tokio::spawn(async move {
                                 sleep(Duration::from_secs(10)).await;
-                                create_and_broadcast_new_block(blockchain_clone, peers_clone, next_writer).await;
+                                create_and_broadcast_new_block(&mut blockchain_clone, &mut peers_clone, next_writer).await;
                             });
                         }
                     }
@@ -271,75 +259,22 @@ fn calculate_hash(index: u64, previous_hash: &str, timestamp: u64, data: &str) -
     format!("{:x}", hasher.finalize())
 }
 
-async fn create_block_after_delay(blockchain: SharedBlockchain, peers: SharedPeers) {
-    sleep(Duration::from_secs(10)).await;
-    println!("Creating and broadcasting new block...");
-
+async fn create_and_broadcast_new_block(blockchain: &mut Blockchain, peers: &mut Vec<Peer>, current_writer: Peer) {
     let data = "Some data".to_string();
-    let (new_block, message) = {
-        let mut blockchain = blockchain.lock().unwrap();
-        let previous_block = blockchain.blocks.last().unwrap();
-        let index = previous_block.index + 1;
-        let previous_hash = &previous_block.hash;
-        let timestamp = Utc::now().timestamp() as u64;
-        let hash = calculate_hash(index, previous_hash, timestamp, &data);
+    let previous_block = blockchain.blocks.last().unwrap();
+    let index = previous_block.index + 1;
+    let previous_hash = &previous_block.hash;
+    let timestamp = Utc::now().timestamp() as u64;
+    let hash = calculate_hash(index, previous_hash, timestamp, &data);
 
-        let peers = peers.lock().unwrap();
-        let next_writer = peers.choose(&mut thread_rng()).unwrap_or(&previous_block.writer).clone();
+    let next_writer = peers.choose(&mut thread_rng()).unwrap_or(&current_writer).clone();
 
-        let new_block = Block::new(index, previous_hash.clone(), timestamp, data, hash, next_writer.clone());
-        blockchain.add_block(new_block.clone());
+    let new_block = Block::new(index, previous_hash.clone(), timestamp, data, hash, next_writer.clone());
+    blockchain.add_block(new_block.clone());
 
-        let message = serde_json::to_string(&Message::NewBlock(new_block.clone())).unwrap();
-        (new_block, message)
-    };
+    let message = serde_json::to_string(&Message::NewBlock(new_block.clone())).unwrap();
 
     println!("Broadcasting new block: {:?}", new_block);
-    let peers: Vec<Peer> = {
-        let peers = peers.lock().unwrap();
-        peers.clone()
-    };
-    for peer in peers.iter() {
-        match TcpStream::connect(peer.address).await {
-            Ok(mut socket) => {
-                if let Err(e) = socket.write_all(message.as_bytes()).await {
-                    println!("Failed to send NewBlock message to {}: {}", peer.address, e);
-                } else {
-                    println!("Sent NewBlock message to {}", peer.address);
-                }
-            }
-            Err(e) => {
-                println!("Failed to connect to peer {}: {}", peer.address, e);
-            }
-        }
-    }
-}
-
-async fn create_and_broadcast_new_block(blockchain: SharedBlockchain, peers: SharedPeers, current_writer: Peer) {
-    let data = "Some data".to_string();
-    let (new_block, message) = {
-        let mut blockchain = blockchain.lock().unwrap();
-        let previous_block = blockchain.blocks.last().unwrap();
-        let index = previous_block.index + 1;
-        let previous_hash = &previous_block.hash;
-        let timestamp = Utc::now().timestamp() as u64;
-        let hash = calculate_hash(index, previous_hash, timestamp, &data);
-
-        let peers = peers.lock().unwrap();
-        let next_writer = peers.choose(&mut thread_rng()).unwrap_or(&current_writer).clone();
-
-        let new_block = Block::new(index, previous_hash.clone(), timestamp, data, hash, next_writer.clone());
-        blockchain.add_block(new_block.clone());
-
-        let message = serde_json::to_string(&Message::NewBlock(new_block.clone())).unwrap();
-        (new_block, message)
-    };
-
-    println!("Broadcasting new block: {:?}", new_block);
-    let peers: Vec<Peer> = {
-        let peers = peers.lock().unwrap();
-        peers.clone()
-    };
     for peer in peers.iter() {
         match TcpStream::connect(peer.address).await {
             Ok(mut socket) => {
