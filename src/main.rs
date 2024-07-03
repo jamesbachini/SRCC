@@ -20,7 +20,6 @@ struct Peer {
 enum Message {
     NewPeer(Peer),
     NewBlock(Block),
-    RequestBlock,
     KeepAlive,
 }
 
@@ -66,7 +65,7 @@ impl Blockchain {
     }
 }
 
-type Peers = Arc<RwLock<HashMap<SocketAddr, Peer>>>;
+type Peers = Arc<RwLock<HashMap<u64, Peer>>>;
 
 #[tokio::main]
 async fn main() {
@@ -166,9 +165,7 @@ async fn handle_outgoing_connection(mut stream: TcpStream, local_peer: Peer, pee
         return;
     }
 
-    let addr = stream.peer_addr().unwrap();
-
-    handle_peer_communication(stream, addr, peers).await;
+    handle_peer_communication(stream, local_peer, peers).await;
 }
 
 async fn handle_connection(mut socket: TcpStream, addr: SocketAddr, peers: Peers, local_peer: Peer) {
@@ -179,16 +176,16 @@ async fn handle_connection(mut socket: TcpStream, addr: SocketAddr, peers: Peers
     }
     println!("Sent NewPeer message to {}", addr);
 
-    handle_peer_communication(socket, addr, peers).await;
+    handle_peer_communication(socket, local_peer, peers).await;
 }
 
-async fn handle_peer_communication(mut stream: TcpStream, addr: SocketAddr, peers: Peers) {
+async fn handle_peer_communication(mut stream: TcpStream, local_peer: Peer, peers: Peers) {
     let mut buffer = vec![0; 4096];
 
     loop {
         match tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer)).await {
             Ok(Ok(0)) => {
-                println!("Connection closed by {}", addr);
+                println!("Connection closed by {}", local_peer.address);
                 break;
             }
             Ok(Ok(n)) => {
@@ -199,35 +196,32 @@ async fn handle_peer_communication(mut stream: TcpStream, addr: SocketAddr, peer
                         continue;
                     }
                 };
-                println!("Received message from {}: {:?}", addr, received_message);
-                handle_message(received_message, &peers).await;
+                println!("Received message from {}: {:?}", local_peer.address, received_message);
+                handle_message(received_message, &peers, &mut stream).await;
             }
             Ok(Err(e)) => {
                 println!("Failed to read from socket: {}", e);
                 break;
             }
-            Err(_) => {
-                // Timeout occurred, send keep-alive message
-                if let Err(e) = stream.write_all(serde_json::to_string(&Message::KeepAlive).unwrap().as_bytes()).await {
-                    println!("Failed to send keep-alive message: {}", e);
-                    break;
-                }
+            Err(e) => {
+                println!("Socket error: {}", e);
+                break;
             }
         }
     }
 
     {
         let mut peers_write = peers.write().await;
-        peers_write.remove(&addr);
+        peers_write.remove(&local_peer.id);
     }
 }
 
-async fn handle_message(message: Message, peers: &Peers) {
+async fn handle_message(message: Message, peers: &Peers, stream: &mut TcpStream) {
     match message {
         Message::NewPeer(new_peer) => {
             println!("New peer connected: {:?}", new_peer);
             let mut peers_write = peers.write().await;
-            peers_write.insert(new_peer.address, new_peer.clone());
+            peers_write.insert(new_peer.id, new_peer.clone());
             println!("Added new peer to peers list: {:?}", new_peer);
         }
         Message::NewBlock(block) => {
@@ -235,18 +229,17 @@ async fn handle_message(message: Message, peers: &Peers) {
             let peers_read = peers.read().await;
             let message = serde_json::to_string(&Message::NewBlock(block)).unwrap();
             for (_, peer) in peers_read.iter() {
-                if let Ok(mut stream) = TcpStream::connect(peer.address).await {
-                    if let Err(e) = stream.write_all(message.as_bytes()).await {
-                        println!("Failed to send NewBlock message: {}", e);
+                if peer.address != stream.peer_addr().unwrap() {
+                    if let Ok(mut other_stream) = TcpStream::connect(peer.address).await {
+                        if let Err(e) = other_stream.write_all(message.as_bytes()).await {
+                            println!("Failed to send NewBlock message to {}: {}", peer.address, e);
+                        }
                     }
                 }
             }
         }
-        Message::RequestBlock => {
-            println!("Request for block received");
-        }
         Message::KeepAlive => {
-            // Do nothing, this is just to keep the connection alive
+            println!("KeepAlive received");
         }
     }
 }
@@ -286,7 +279,7 @@ async fn create_and_broadcast_new_block(blockchain: Arc<RwLock<Blockchain>>, pee
 
     let message = serde_json::to_string(&Message::NewBlock(new_block.clone())).unwrap();
 
-    println!("Broadcasting new block: {:?}", new_block);
+    println!("Broadcasting new block: {:?}", message);
     let peers_read = peers.read().await;
     println!("Broadcasting to peers: {:?}", peers_read);
     for (_, peer) in peers_read.iter() {
