@@ -183,7 +183,7 @@ async fn handle_peer_communication(mut stream: TcpStream, local_peer: Peer, peer
     let mut buffer = vec![0; 4096];
 
     loop {
-        match tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer)).await {
+        match tokio::time::timeout(Duration::from_secs(300), stream.read(&mut buffer)).await {
             Ok(Ok(0)) => {
                 println!("Connection closed by {}", local_peer.address);
                 break;
@@ -217,6 +217,7 @@ async fn handle_peer_communication(mut stream: TcpStream, local_peer: Peer, peer
 }
 
 async fn handle_message(message: Message, peers: &Peers, stream: &mut TcpStream) {
+    println!("New MSG");
     match message {
         Message::NewPeer(new_peer) => {
             println!("New peer connected: {:?}", new_peer);
@@ -226,6 +227,7 @@ async fn handle_message(message: Message, peers: &Peers, stream: &mut TcpStream)
         }
         Message::NewBlock(block) => {
             println!("New block received: {:?}", block);
+            /*
             let peers_read = peers.read().await;
             let message = serde_json::to_string(&Message::NewBlock(block)).unwrap();
             for (_, peer) in peers_read.iter() {
@@ -237,6 +239,7 @@ async fn handle_message(message: Message, peers: &Peers, stream: &mut TcpStream)
                     }
                 }
             }
+            */
         }
         Message::KeepAlive => {
             println!("KeepAlive received");
@@ -284,8 +287,9 @@ async fn create_and_broadcast_new_block(blockchain: Arc<RwLock<Blockchain>>, pee
     println!("Broadcasting to peers: {:?}", peers_read);
     for (_, peer) in peers_read.iter() {
         if let Ok(mut stream) = TcpStream::connect(peer.address).await {
-            if let Err(e) = stream.write_all(message.as_bytes()).await {
-                println!("Failed to send NewBlock message: {}", e);
+            println!("Sending to peer: {:?}", peer.address);
+            if let Ok(m) = stream.write_all(message.as_bytes()).await {
+                println!("Sent NewBlock message: {:?}", message);
             }
         }
     }
